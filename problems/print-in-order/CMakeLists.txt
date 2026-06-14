@@ -12,21 +12,22 @@ target_compile_options(bench_print_in_order PRIVATE -O3 -DNDEBUG)
 # Each solution is compiled into its OWN -O3 -march=native binary. This is the
 # "engine compiles a solution optimized and runs it" piece; scripts/compare.sh
 # builds all of them and runs each in isolation.
-function(add_runner name header type)
+function(add_runner name header type gate)
   add_executable(runner_${name} runner/runner.cpp)
   target_link_libraries(runner_${name} PRIVATE engine)
   target_compile_options(runner_${name} PRIVATE -O3 -DNDEBUG -march=native)
   target_compile_definitions(runner_${name} PRIVATE
     SOLUTION_HEADER="${header}"
     SOLUTION_TYPE=${type}
+    SOLUTION_GATE=${gate}
     SOLUTION_NAME="${name}")
 endfunction()
 
-add_runner(condition_variable problems/print-in-order/solutions/ConditionVariable.hpp pio::FooCV)
-add_runner(atomic_wait        problems/print-in-order/solutions/AtomicWait.hpp        pio::FooAtomicWait)
-add_runner(spinlock           problems/print-in-order/solutions/Spinlock.hpp          pio::FooSpin)
-add_runner(spinlock_pause     problems/print-in-order/solutions/SpinlockPause.hpp     pio::FooSpinPause)
-add_runner(spinlock_yield     problems/print-in-order/solutions/SpinlockYield.hpp     pio::FooSpinYield)
+add_runner(condition_variable problems/print-in-order/solutions/ConditionVariable.hpp pio::FooCV         pio::CVGate)
+add_runner(atomic_wait        problems/print-in-order/solutions/AtomicWait.hpp        pio::FooAtomicWait pio::AtomicWaitGate)
+add_runner(spinlock           problems/print-in-order/solutions/Spinlock.hpp          pio::FooSpin       pio::SpinGate)
+add_runner(spinlock_pause     problems/print-in-order/solutions/SpinlockPause.hpp     pio::FooSpinPause  pio::SpinGatePause)
+add_runner(spinlock_yield     problems/print-in-order/solutions/SpinlockYield.hpp     pio::FooSpinYield  pio::SpinGateYield)
 
 # Convenience target that the compare script drives.
 add_custom_target(runners

@@ -39,7 +39,21 @@ and `FetchContent` (`SYSTEM` + `EXCLUDE_FROM_ALL` + `FIND_PACKAGE_ARGS`).
 
 | problem | comparison | headline result |
 |---|---|---|
-| [Print in Order](problems/print-in-order/) (LC 1114) | condition variable vs spinlock, plus `atomic_wait` / pause / yield variants | spinlock is **7–9× slower under contention**; `atomic_wait` (4 B, lock-free) **ties** the condition variable — so the cost was busy-*waiting*, not the lock-free design |
+| [Print in Order](problems/print-in-order/) (LC 1114) | condition variable vs spinlock, plus `atomic_wait` / pause / yield variants | the spinlock is **~350× faster** for a hot, non-oversubscribed handoff but up to **~35× slower** once oversubscribed *with work to do*; `atomic_wait` is the robust modern middle |
+
+## Learning: where each primitive wins
+
+The repo isn't just a leaderboard — it sweeps the parameter space and graphs the
+crossover. Full write-up: **[docs/print-in-order-deep-dive.md](docs/print-in-order-deep-dive.md)**.
+The two knobs that decide the winner are **oversubscription** (threads / cores)
+and **work per thread**:
+
+![winner heatmap](docs/img/winner_heatmap.png)
+
+```bash
+./scripts/sweep.sh        # parameter grid for all solutions -> results/sweep.csv
+python3 scripts/plot.py   # renders the graphs into docs/img/
+```
 
 ## Quick start
 
@@ -78,6 +92,7 @@ write-up of *why* the spinlock is slower.
 
 - CMake ≥ 3.28, Ninja, a C++23 compiler (tested with g++ 15.2)
 - Internet on first configure (Catch2 is fetched via `FetchContent`)
+- For the graphs: Python 3 with `matplotlib` + `numpy` (no pandas needed)
 
 ## Adding a problem
 

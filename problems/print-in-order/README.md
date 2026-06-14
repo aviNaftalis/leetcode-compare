@@ -7,6 +7,11 @@ an arbitrary order. The job is to guarantee the prints happen as
 `first → second → third`. A thread that arrives early has to **wait**, and *how*
 it waits is the whole story.
 
+> 📈 **For the full parameter sweep with graphs** — where the spinlock wins, where
+> it loses, and the variables that move the line — see
+> **[../../docs/print-in-order-deep-dive.md](../../docs/print-in-order-deep-dive.md)**.
+> The summary below is the fixed-workload head-to-head.
+
 ## The solutions
 
 | solution | how it waits | object size |

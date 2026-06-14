@@ -168,4 +168,76 @@ template <PrintInOrder Solution>
     return {samples[samples.size() / 2], samples.front(), samples.back()};
 }
 
+// ---------------------------------------------------------------------------
+// Relay mode
+// ---------------------------------------------------------------------------
+// The one-shot batch above creates threads per problem, so at low concurrency
+// thread-creation cost swamps the synchronization cost. The relay mode instead
+// keeps a small set of long-lived threads passing a baton through many stages,
+// so pure *handoff latency* dominates. This is the regime where a spinlock can
+// win: a hot, non-oversubscribed handoff avoids the futex syscall a parking
+// primitive pays on every wakeup.
+//
+// A "gate" is the underlying waiting primitive each solution is built on
+// (wait until the counter reaches a target, then advance it). Each lane owns one
+// gate and 3 threads; the threads relay a single counter 0..3*rounds, so every
+// stage hands off to the next with no barrier. `lanes` controls oversubscription
+// (3*lanes threads vs the core count).
+template <class G>
+concept SequentialGate = requires(G g, int v) {
+    { g.wait_for(v) };
+    { g.advance_to(v) };
+};
+
+struct RelayCase {
+    std::string_view name;
+    int lanes = 1;        // parallel relays; 3*lanes threads => oversubscription
+    int rounds = 100'000; // full first->second->third cycles per lane
+    Work work{};
+};
+
+template <SequentialGate Gate>
+void runRelay(const RelayCase& rc) {
+    const int stages = 3 * rc.rounds;
+    auto gates =
+        std::views::iota(0, rc.lanes) | std::views::transform([](int) {
+            return std::make_unique<Gate>();
+        }) |
+        std::ranges::to<std::vector>();
+    std::atomic<std::uint64_t> sink{0};
+    std::latch start{1};
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(static_cast<std::size_t>(rc.lanes) * 3);
+        for (auto& g : gates)
+            for (int role : {0, 1, 2})
+                threads.emplace_back([&, gate = g.get(), role] {
+                    start.wait();
+                    std::uint64_t acc = 0;
+                    for (int target = role; target < stages; target += 3) {
+                        gate->wait_for(target);
+                        acc ^= run(rc.work);
+                        gate->advance_to(target + 1);
+                    }
+                    sink.fetch_xor(acc, std::memory_order_relaxed);
+                });
+        start.count_down();
+    } // jthreads join here
+}
+
+template <SequentialGate Gate>
+[[nodiscard]] Timing timeRelay(const RelayCase& rc, int trials) {
+    using clock = std::chrono::steady_clock;
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(trials));
+    for ([[maybe_unused]] int t : std::views::iota(0, trials)) {
+        const auto t0 = clock::now();
+        runRelay<Gate>(rc);
+        const auto t1 = clock::now();
+        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
+    std::ranges::sort(samples);
+    return {samples[samples.size() / 2], samples.front(), samples.back()};
+}
+
 } // namespace engine
