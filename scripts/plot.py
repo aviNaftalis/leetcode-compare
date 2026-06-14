@@ -41,6 +41,12 @@ COLOR = {
 WORKLABEL = {("none", "0"): "trivial", ("cpu", "500"): "cpu light",
              ("cpu", "4000"): "cpu heavy", ("cpu", "20000"): "cpu",
              ("sleep", "200"): "sleep / IO"}
+# Short, variant-distinguishing names so the heatmap never hides which kind of
+# "spinlock" actually won (yield gives the core back; naked/pause hold it).
+SHORT = {"spinlock": "spin-naked", "spinlock_pause": "spin-pause",
+         "spinlock_yield": "spin-yield", "atomic_wait": "atomic_wait",
+         "condition_variable": "cond_var"}
+HOLDS_CORE = {"spinlock", "spinlock_pause"}  # true busy-wait
 
 
 def load():
@@ -130,13 +136,15 @@ def plot_heatmap(rows):
     ax.set_xticks(range(len(works)), [WORKLABEL.get(w, "/".join(w)) for w in works])
     ax.set_yticks(range(len(lanes)), [f"{3*ln/CORES:g}×\n({3*ln} thr)" for ln in lanes])
     ax.set_xlabel("work per stage")
-    ax.set_ylabel("oversubscription")
+    ax.set_ylabel("oversubscription  (steady-state relay = next-in-line waiter)")
     ax.set_title("Who wins each regime (cell = fastest solution)\n"
-                 "annotation: naked-spinlock slowdown vs the winner")
+                 "annotation: how much slower the naked busy-spin is than the winner")
     for i, ln in enumerate(lanes):
         for j, wk in enumerate(works):
             win, ratio = best[(ln, wk)]
-            ax.text(j, i, f"{LABEL[win].split(' ')[0]}\n{ratio:.0f}× spin",
+            rtxt = f"{ratio:.0f}×" if ratio >= 2 else f"{ratio:.1f}×"
+            note = "busy-spin wins" if win in HOLDS_CORE else f"busy-spin {rtxt}"
+            ax.text(j, i, f"{SHORT[win]}\n({note})",
                     ha="center", va="center", color="white", fontsize=8, fontweight="bold")
     handles = [plt.Rectangle((0, 0), 1, 1, color=COLOR[s]) for s in ORDER]
     ax.legend(handles, [LABEL[s] for s in ORDER], loc="center left",

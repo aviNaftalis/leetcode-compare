@@ -67,30 +67,53 @@ to sink a spinlock.** You need the other knob too.
 ## 3. Both knobs together — the real crossover
 
 Now vary oversubscription **and** work, and colour each cell by its fastest
-solution (annotation = how many times slower the naked spinlock is than the
-winner):
+solution. The parenthesised note says how the **naked busy-spin** (the variant
+that *holds* a core) did — so you can read off exactly when busy-waiting pays:
 
 ![winner heatmap](img/winner_heatmap.png)
 
-- **Top half (threads fit on cores):** a spin variant wins everywhere, even with
-  heavy CPU work.
-- **Bottom-right (oversubscribed *and* real work):** parking wins decisively —
-  the naked spinlock is **8× slower** than `condition_variable` on cpu-light and
-  **35× slower** than `atomic_wait` on cpu-heavy. A spinning waiter is now burning
-  a core running its busy-loop while the thread that owns the baton has real work
-  to do and can't get scheduled.
-- `atomic_wait` is the most robust square on the map: spinlock-tiny object,
-  lock-free fast path, but it sleeps instead of starving the worker.
+> ⚠️ **Read the variant, not just the colour.** Three different "spinlocks" live
+> here. `spin-naked` and `spin-pause` *hold* the core while waiting (true
+> busy-waiting). `spin-yield` calls `yield()` and *gives the core back* — so when
+> a cell is won by `spin-yield`, busy-waiting did **not** win there; a
+> core-returning strategy did. The annotation makes this explicit.
 
-The crossover isn't a line at 1× — it's a corner. You need **enough threads to
-contend for cores AND enough work that losing a core actually hurts.**
+Two structural facts about this benchmark matter for reading it:
+
+- **The relay is a high-replacement-frequency scenario by construction.** The
+  waiting thread is always the *next* one to receive the baton, so its
+  probability of needing the CPU imminently is ~100%. That is exactly the
+  classic precondition for spinning to pay off — which is why busy-spin wins so
+  much of this map. It is *not* evidence that spinning beats parking in general.
+- **"Oversubscription" here is nominal.** A relay lane has one thread working,
+  one spinning for the next handoff, and one further back — so effective
+  concurrency is well below `3 × lanes`.
+
+With that in mind:
+
+- **Top rows / trivial column (a core is effectively free for the next-in-line
+  waiter):** busy-spin wins — no real work for the spinner to steal a core
+  *from*, and the waiter runs the instant the baton arrives.
+- **cpu-heavy column, climbing oversubscription:** the winner walks from
+  `spin-naked` → `spin-yield` → `atomic_wait`. By 6× the naked busy-spin is
+  **35× slower** than the winner: now there genuinely aren't enough cores, and a
+  busy-spinner is burning one that the baton-holder needs to do real work.
+- `atomic_wait` is the most robust square: spinlock-tiny object, lock-free fast
+  path, but it sleeps instead of starving the worker.
+
+So busy-waiting wins only where you'd expect from first principles — **a (near-)
+dedicated core for a waiter that's about to run** — and loses exactly where you'd
+expect: oversubscribed *with real work to do*.
 
 ---
 
 ## 4. Work *type* under a thundering herd — the harshest case for spinning
 
-One-shot mode releases 96 threads (8× the cores) simultaneously off a latch — a
-thundering herd where everyone contends at once. Vary what each action does:
+The heatmap above is the steady-state relay, where every waiter is next-in-line.
+This is the opposite: one-shot mode releases 96 threads (8× the cores)
+simultaneously off a latch — a **thundering herd** where most waiters are *not*
+about to run (they're blocked behind a long chain), so the replacement-frequency
+argument that helped spinning in §3 no longer applies. Vary what each action does:
 
 ![work type bars](img/work_type_bars.png)
 
@@ -110,15 +133,21 @@ solutions — because it hands the core back. The lesson is precise: it's
 
 ## The variables, summarised
 
-| variable | favours spinning | favours parking |
+| variable | favours busy-spin | favours parking |
 |---|---|---|
-| **oversubscription** (threads / cores) | ≤ ~6× *if work is trivial*; ≤ 1× once work is real | high + real work |
+| **free core for the waiter** | yes — (near-)dedicated core available | no — cores oversubscribed |
+| **replacement frequency** (will the waiter run *soon*?) | high — waiter is next-in-line | low — waiter blocked behind a long chain |
 | **work / wait duration** | very short (< a syscall, ~1–5 µs) | long |
 | **work type** while holding the baton | — | blocking I/O (holder off-CPU) |
-| **contention pattern** | steady state, few active at once | thundering herd |
+| **oversubscription** (threads / cores) | ≤ 1× with real work; tolerated higher only when work is trivial | high + real work |
 | **thread affinity** | pinned, hot threads | threads migrate / share cores |
 | **object count / cache** | millions of locks → 4 B atomic wins on footprint | — |
 | **wakeup-latency requirement** | need deterministic ns wakeup | µs jitter acceptable |
+
+The first two rows are the heart of it — and they're the conditions you'd state
+from first principles: **busy-spin pays only when a waiter has a core to spin on
+*and* is about to need it.** Everything else (work, oversubscription, herd vs
+steady state) is really just a way those two conditions get satisfied or broken.
 
 ## Rules of thumb
 
