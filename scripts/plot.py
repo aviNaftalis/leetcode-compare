@@ -88,8 +88,73 @@ def lineplot(data, xkey, ykey, fname, title, xlabel, ylabel, xlog=False, ylog=Fa
     plt.close(fig)
 
 
+SHORT_COL = {"ttas_backoff": "ttas+bo", "std_mutex": "std::mutex",
+             "shared_mutex": "shared_mtx", "excl_ttas": "excl(ttas)",
+             "spin_yield": "spin+yld", "cv": "cond_var", "atomic_wait": "atomic::wait"}
+
+
+def plot_summary(rows):
+    """One chart: who wins each use case. Rows = use cases, columns = every
+    primitive, colour = score relative to the best in that row (green=best),
+    star = winner, gray = not applicable. Cell text is the raw measured value."""
+    cols = ["tas", "ttas", "ttas_backoff", "ticket", "mcs", "std_mutex", "atomic",
+            "shared_mutex", "excl_ttas", "spin", "spin_yield", "cv", "atomic_wait"]
+
+    def grab(s, pred, metric):
+        return {r["primitive"]: r[metric] for r in series(rows, s) if pred(r)}
+
+    # (label, data dict, higher_is_better, value formatter)
+    f_tp = lambda v: f"{v:.0f}" if v >= 10 else f"{v:.1f}"
+    rowdefs = [
+        ("uncontended\nthroughput Mops↑", grab("contention", lambda r: r["threads"] == 1, "throughput_Mops"), True, f_tp),
+        ("contended 8 thr\nthroughput Mops↑", grab("contention", lambda r: r["threads"] == 8, "throughput_Mops"), True, f_tp),
+        ("oversub 24 thr\nthroughput Mops↑", grab("contention", lambda r: r["threads"] == 24, "throughput_Mops"), True, f_tp),
+        ("long crit-section\nthroughput Mops↑", grab("cs_length", lambda r: r["cs"] == 20000, "throughput_Mops"), True, lambda v: f"{v:.2f}"),
+        ("fairness 8 thr\nlow spread↑", grab("contention", lambda r: r["threads"] == 8, "fairness_cov"), False, lambda v: f"{v:.2f}"),
+        ("read-only\nthroughput Mops↑", grab("readheavy", lambda r: r["write"] == 0, "throughput_Mops"), True, lambda v: f"{v:.2f}"),
+        ("signaling\nlow latency↑", grab("signaling", lambda r: r["threads"] == 1, "ns_per_op"), False, lambda v: f"{v:.0f}ns"),
+        ("signaling\nlow CPU↑", grab("signaling", lambda r: r["threads"] == 1, "cores"), False, lambda v: f"{v:.1f}c"),
+    ]
+
+    M = np.full((len(rowdefs), len(cols)), np.nan)
+    for i, (_, d, hi, _) in enumerate(rowdefs):
+        present = {c: d[c] for c in cols if c in d}
+        pos = [v for v in present.values() if v > 0]
+        if not pos:
+            continue
+        best = max(pos) if hi else min(pos)
+        for c, v in present.items():
+            M[i, cols.index(c)] = (v / best if hi else (best / v if v > 0 else np.nan)) if best > 0 else np.nan
+
+    masked = np.ma.masked_invalid(M)
+    cmap = plt.cm.RdYlGn.copy()
+    cmap.set_bad("#e6e6e6")
+    fig, ax = plt.subplots(figsize=(13.5, 6.2))
+    ax.imshow(masked, cmap=cmap, vmin=0.0, vmax=1.0, aspect="auto")
+    ax.set_xticks(range(len(cols)), [SHORT_COL.get(c, c) for c in cols], rotation=40, ha="right")
+    ax.set_yticks(range(len(rowdefs)), [r[0] for r in rowdefs])
+    ax.set_xticks(np.arange(-.5, len(cols), 1), minor=True)
+    ax.set_yticks(np.arange(-.5, len(rowdefs), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=2)
+    ax.tick_params(which="minor", length=0)
+    for i, (_, d, hi, fmt) in enumerate(rowdefs):
+        for j, c in enumerate(cols):
+            if masked.mask[i, j]:
+                continue
+            win = abs(float(masked[i, j]) - 1.0) < 1e-9
+            ax.text(j, i, ("★\n" if win else "") + fmt(d[c]), ha="center", va="center",
+                    fontsize=7.5, fontweight="bold" if win else "normal")
+    ax.set_title("Which synchronization primitive wins each use case\n"
+                 "★ = best in row · green→red = score relative to the row winner · gray = not applicable",
+                 fontsize=12)
+    fig.tight_layout()
+    fig.savefig(os.path.join(IMG, "summary.png"), dpi=130)
+    plt.close(fig)
+
+
 def main():
     rows = load()
+    plot_summary(rows)
 
     # 1. Contention: throughput, fairness, CPU vs thread count.
     c = series(rows, "contention")
@@ -147,7 +212,7 @@ def main():
     fig.savefig(os.path.join(IMG, "signaling.png"), dpi=130)
     plt.close(fig)
 
-    print(f"Wrote 6 graphs to {IMG}")
+    print(f"Wrote 7 graphs to {IMG}")
 
 
 if __name__ == "__main__":
