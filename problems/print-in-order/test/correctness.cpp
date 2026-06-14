@@ -5,9 +5,10 @@
 // solution is meaningless, so this runs first (ctest) and the benchmark only
 // matters once these pass.
 
-#include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_template_test_macros.hpp>
+#include <catch2/catch_test_macros.hpp>
 
+#include "problems/print-in-order/solutions/AtomicWait.hpp"
 #include "problems/print-in-order/solutions/ConditionVariable.hpp"
 #include "problems/print-in-order/solutions/Spinlock.hpp"
 #include "problems/print-in-order/solutions/SpinlockPause.hpp"
@@ -18,13 +19,14 @@ using namespace pio;
 
 namespace {
 // All six launch permutations, so we never accidentally only test the easy one.
-const std::array<std::array<int, 3>, 6> kOrders{{
+constexpr std::array<std::array<int, 3>, 6> kOrders{{
     {1, 2, 3}, {1, 3, 2}, {2, 1, 3}, {2, 3, 1}, {3, 1, 2}, {3, 2, 1},
 }};
 } // namespace
 
 TEMPLATE_TEST_CASE("ordering holds for every launch permutation", "[correctness]",
-                   FooCV, FooSpin, FooSpinPause, FooSpinYield) {
+                   FooCV, FooSpin, FooSpinPause, FooSpinYield, FooAtomicWait) {
+    static_assert(engine::PrintInOrder<TestType>);
     for (auto order : kOrders) {
         CAPTURE(order);
         REQUIRE(engine::runWorkload<TestType>(testcases::smoke(order)));

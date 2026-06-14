@@ -23,11 +23,12 @@ function(add_runner name header type)
 endfunction()
 
 add_runner(condition_variable problems/print-in-order/solutions/ConditionVariable.hpp pio::FooCV)
+add_runner(atomic_wait        problems/print-in-order/solutions/AtomicWait.hpp        pio::FooAtomicWait)
 add_runner(spinlock           problems/print-in-order/solutions/Spinlock.hpp          pio::FooSpin)
 add_runner(spinlock_pause     problems/print-in-order/solutions/SpinlockPause.hpp     pio::FooSpinPause)
 add_runner(spinlock_yield     problems/print-in-order/solutions/SpinlockYield.hpp     pio::FooSpinYield)
 
 # Convenience target that the compare script drives.
 add_custom_target(runners
-  DEPENDS runner_condition_variable runner_spinlock
+  DEPENDS runner_condition_variable runner_atomic_wait runner_spinlock
           runner_spinlock_pause runner_spinlock_yield)

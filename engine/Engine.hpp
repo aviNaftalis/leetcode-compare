@@ -1,19 +1,18 @@
 // engine/Engine.hpp
 //
-// The test engine. It is deliberately solution-agnostic: it knows how to drive
-// *any* "Print in Order" solution (a type exposing first/second/third taking a
-// std::function<void()>) through a configurable workload, verify correctness,
-// and report the metrics we care about (wall time + peak RSS + object size).
+// The test engine. It is deliberately solution-agnostic: given any type that
+// satisfies the PrintInOrder concept it drives a configurable workload, checks
+// the ordering held, and reports the metrics we care about (wall time + peak
+// RSS + object size).
 //
-// The same engine is consumed by three front-ends:
+// Shared by three front-ends, so each compiles the chosen solution inline and
+// -O3 can fully inline the synchronization primitives:
 //   * test/correctness.cpp  -> Catch2 assertions that the ordering holds
 //   * bench/benchmark.cpp   -> Catch2 statistical micro-benchmark
-//   * runner/runner.cpp     -> a standalone, per-solution optimized binary that
-//                              the compare script builds & runs in isolation
+//   * runner/runner.cpp      -> a standalone, per-solution optimized binary
 //
-// Keeping the engine header-only means every front-end compiles the chosen
-// solution inline, so -O3 can inline the synchronization primitives — exactly
-// the conditions LeetCode-style benchmarking is supposed to model.
+// Modern bits: C++23, std::jthread (RAII join), a concept to constrain
+// solutions, std::latch for a simultaneous start, std::ranges algorithms.
 
 #pragma once
 
@@ -21,12 +20,19 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <latch>
 #include <memory>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
+
+#include "engine/Work.hpp"
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -34,91 +40,102 @@
 
 namespace engine {
 
+// A valid solution exposes the three LeetCode entry points, each taking the
+// print callback by std::function<void()> (the original signature).
+template <class T>
+concept PrintInOrder = requires(T t, std::function<void()> cb) {
+    { t.first(cb) };
+    { t.second(cb) };
+    { t.third(cb) };
+};
+
 // ---------------------------------------------------------------------------
-// A single "Print in Order" sub-problem: one solution object plus the sequence
-// of tokens its callbacks actually emitted, so we can check ordering.
+// A test case describes a workload shape, never a solution.
 // ---------------------------------------------------------------------------
-template <class Solution>
+struct TestCase {
+    std::string_view name;
+    int instances = 1;                  // concurrent Foo problems
+    int repetitions = 1;                // times the whole batch is replayed
+    std::array<int, 3> order{1, 2, 3};  // order threads are *launched* in
+    Work work{};                        // payload each action runs
+};
+
+// ---------------------------------------------------------------------------
+// One "Print in Order" sub-problem: the solution object, the sequence of tokens
+// its callbacks actually emitted (to verify ordering), and a sink so the work
+// payload cannot be optimized away.
+// ---------------------------------------------------------------------------
+template <PrintInOrder Solution>
 struct Instance {
     Solution foo;
     std::array<int, 3> seq{0, 0, 0};
     std::atomic<int> pos{0};
+    std::atomic<std::uint64_t> sink{0};
 
-    void call(int role) {
-        // The callback records *the order in which prints happened*. The slot
-        // index comes from a shared counter, so a correct solution yields
-        // {1,2,3} and a broken one yields something else.
-        auto record = [this, role] {
+    void call(int role, const Work& work) {
+        auto action = [this, role, &work] {
+            sink.fetch_xor(run(work), std::memory_order_relaxed);
             seq[pos.fetch_add(1, std::memory_order_relaxed)] = role;
         };
         switch (role) {
-            case 1: foo.first(record); break;
-            case 2: foo.second(record); break;
-            case 3: foo.third(record); break;
+        case 1: foo.first(action); break;
+        case 2: foo.second(action); break;
+        case 3: foo.third(action); break;
         }
     }
 
-    bool ordered() const { return seq == std::array<int, 3>{1, 2, 3}; }
+    [[nodiscard]] bool ordered() const noexcept {
+        return seq == std::array<int, 3>{1, 2, 3};
+    }
 };
 
 // ---------------------------------------------------------------------------
-// A test case describes a workload shape, not a solution.
+// Run one batch: spin up `instances * 3` threads, all live at once, gate them
+// on a latch so they start together, then release. Launching in role order
+// {3,2,1} means every "third"/"second" thread is already waiting before any
+// "first" exists — the worst case for busy-waiting.
 // ---------------------------------------------------------------------------
-struct TestCase {
-    std::string name;
-    int instances;            // how many Foo problems run concurrently
-    int repetitions;          // how many times the whole batch is replayed
-    std::array<int, 3> order; // the order threads are *launched* in (1,2,3 = roles)
-};
-
-// ---------------------------------------------------------------------------
-// Run one batch: spin up `instances * 3` threads, all live at once, launched in
-// the configured role order, then join. Launching e.g. {3,2,1} means every
-// "third" and "second" thread is created (and, for a spinlock, already busy
-// waiting) before any "first" thread exists — the worst case for busy-waiting.
-// ---------------------------------------------------------------------------
-template <class Solution>
+template <PrintInOrder Solution>
 bool runBatch(const TestCase& tc) {
-    std::vector<std::unique_ptr<Instance<Solution>>> insts;
-    insts.reserve(tc.instances);
-    for (int i = 0; i < tc.instances; ++i)
-        insts.push_back(std::make_unique<Instance<Solution>>());
+    auto insts =
+        std::views::iota(0, tc.instances) | std::views::transform([](int) {
+            return std::make_unique<Instance<Solution>>();
+        }) |
+        std::ranges::to<std::vector>();
 
-    std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(tc.instances) * 3);
+    std::latch start{1};
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(static_cast<std::size_t>(tc.instances) * 3);
+        for (int role : tc.order)
+            for (auto& in : insts)
+                threads.emplace_back([&start, p = in.get(), role, &tc] {
+                    start.wait();
+                    p->call(role, tc.work);
+                });
+        start.count_down(); // release the storm
+    } // jthreads join here
 
-    for (int role : tc.order)
-        for (auto& in : insts) {
-            Instance<Solution>* p = in.get();
-            threads.emplace_back([p, role] { p->call(role); });
-        }
-
-    for (auto& t : threads) t.join();
-
-    for (auto& in : insts)
-        if (!in->ordered()) return false;
-    return true;
+    return std::ranges::all_of(insts, [](const auto& in) { return in->ordered(); });
 }
 
-// Run the full workload (all repetitions). Returns true iff every batch was
-// correctly ordered.
-template <class Solution>
+template <PrintInOrder Solution>
 bool runWorkload(const TestCase& tc) {
     bool ok = true;
-    for (int r = 0; r < tc.repetitions; ++r)
-        ok &= runBatch<Solution>(tc);
+    for ([[maybe_unused]] int r : std::views::iota(0, tc.repetitions))
+        ok = runBatch<Solution>(tc) && ok;
     return ok;
 }
 
 // ---------------------------------------------------------------------------
-// Metrics helpers
+// Metrics
 // ---------------------------------------------------------------------------
 
 // Peak resident set size in KiB since process start (0 if unsupported).
-inline long peakRSSKiB() {
+[[nodiscard]] inline long peakRSSKiB() noexcept {
 #if defined(__unix__) || defined(__APPLE__)
     rusage ru{};
-    getrusage(RUSAGE_SELF, &ru);
+    ::getrusage(RUSAGE_SELF, &ru);
 #if defined(__APPLE__)
     return ru.ru_maxrss / 1024; // macOS reports bytes
 #else
@@ -130,26 +147,25 @@ inline long peakRSSKiB() {
 }
 
 struct Timing {
-    double median_ms;
-    double min_ms;
-    double max_ms;
+    double median_ms = 0;
+    double min_ms = 0;
+    double max_ms = 0;
 };
 
-// Time a workload over `trials` runs and return median/min/max in milliseconds.
-template <class Solution>
-Timing timeWorkload(const TestCase& tc, int trials) {
+template <PrintInOrder Solution>
+[[nodiscard]] Timing timeWorkload(const TestCase& tc, int trials) {
+    using clock = std::chrono::steady_clock;
     std::vector<double> samples;
-    samples.reserve(trials);
-    for (int t = 0; t < trials; ++t) {
-        auto t0 = std::chrono::steady_clock::now();
-        volatile bool ok = runWorkload<Solution>(tc);
-        (void)ok;
-        auto t1 = std::chrono::steady_clock::now();
-        samples.push_back(
-            std::chrono::duration<double, std::milli>(t1 - t0).count());
+    samples.reserve(static_cast<std::size_t>(trials));
+    for ([[maybe_unused]] int t : std::views::iota(0, trials)) {
+        const auto t0 = clock::now();
+        const bool ok = runWorkload<Solution>(tc);
+        const auto t1 = clock::now();
+        if (!ok) return {}; // caller treats all-zero as failure
+        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
     }
-    std::sort(samples.begin(), samples.end());
-    return Timing{samples[samples.size() / 2], samples.front(), samples.back()};
+    std::ranges::sort(samples);
+    return {samples[samples.size() / 2], samples.front(), samples.back()};
 }
 
 } // namespace engine
