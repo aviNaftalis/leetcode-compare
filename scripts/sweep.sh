@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# sweep.sh — run the full shootout grid and emit results/sweep.csv for plot.py.
-# Series (each picked to show a use case where some primitive shines):
-#   contention   throughput / fairness / CPU vs thread count (tiny critical section)
-#   cs_length    throughput vs critical-section length, oversubscribed
-#   readheavy    throughput vs write fraction (reader-writer lock)
-#   signaling    hand-off latency + CPU, hot vs oversubscribed
+# sweep.sh — run the shootout across thread counts and emit results/sweep.csv.
+# Two configurations, each reporting throughput (Mops) and latency (ns/op):
+#   write   write-contended counter (read=0, cs=0)            — mutual exclusion
+#   read    read-mostly with a real read section (read=95%, cs=1000) — RW lock shines
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,42 +16,28 @@ cmake --build "$BUILD" --target shootout -j "$CORES" >/dev/null
 BIN="$BUILD/shootout"
 
 mkdir -p "$ROOT/results"
-echo "series,scenario,primitive,threads,cs,write,wall_ms,cpu_ms,cores,throughput_Mops,ns_per_op,fairness_cov,bytes" > "$OUT"
+echo "config,primitive,threads,read,cs,throughput_Mops,ns_per_op,bytes" > "$OUT"
 
-emit() { # series + shootout args -> tagged CSV row
-  local series="$1"; shift
+emit() { # config + shootout args -> tagged CSV row
+  local cfg="$1"; shift
   local row; row="$("$BIN" "$@" 2>/dev/null | grep '^CSV,' | sed 's/^CSV,//')"
-  echo "$series,$row" >> "$OUT"
-  echo "  [$series] $*"
+  echo "$cfg,$row" >> "$OUT"
+  echo "  [$cfg] $*"
 }
 
-LOCKS=(tas ttas ttas_backoff ticket mcs std_mutex atomic)
+THREADS=(1 2 4 8 12 16 24 32)
 
-echo ">> Series 1/4: contention vs thread count (tiny critical section)"
-for thr in 1 2 4 8 12 16 24 32; do
-  for p in "${LOCKS[@]}"; do
-    emit contention --scenario contended --primitive "$p" --threads "$thr" --cs 0 --secs 0.25 --trials 5
+echo ">> write-contended counter (read=0, cs=0)"
+for t in "${THREADS[@]}"; do
+  for p in cv std_mutex shared_mutex ticket atomic; do
+    emit write --primitive "$p" --threads "$t" --read 0 --cs 0 --secs 0.25 --trials 5
   done
 done
 
-echo ">> Series 2/4: critical-section length, oversubscribed (24 threads)"
-for cs in 0 50 200 1000 5000 20000; do
-  for p in tas ttas_backoff ticket mcs std_mutex; do
-    emit cs_length --scenario contended --primitive "$p" --threads 24 --cs "$cs" --secs 0.25 --trials 5
-  done
-done
-
-echo ">> Series 3/4: read-heavy vs write fraction (8 threads, meaty reads)"
-for w in 0 1 5 20 50; do
-  for p in shared_mutex excl_ttas excl_std; do
-    emit readheavy --scenario readheavy --primitive "$p" --threads 8 --write "$w" --cs 2000 --secs 0.25 --trials 5
-  done
-done
-
-echo ">> Series 4/4: signaling hand-off (hot=1 lane, oversubscribed=12 lanes)"
-for lanes in 1 12; do
-  for p in spin spin_yield cv atomic_wait; do
-    emit signaling --scenario signaling --primitive "$p" --threads "$lanes" --rounds 15000 --trials 3
+echo ">> read-only (read=100%, cs=1000) — atomic omitted (lock-free guards one word only)"
+for t in "${THREADS[@]}"; do
+  for p in cv std_mutex shared_mutex ticket; do
+    emit read --primitive "$p" --threads "$t" --read 100 --cs 1000 --secs 0.25 --trials 5
   done
 done
 

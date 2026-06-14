@@ -1,96 +1,141 @@
 # sync-shootout
 
-A **modern C++23 benchmark of thread synchronization primitives** — the classic
-"lock shootout" / synchronization-primitive microbenchmark. It pits spinlocks,
-blocking mutexes, fair locks, reader-writer locks, lock-free code, and event
-signaling against each other across **multithreading scenarios chosen so each
-primitive gets a use case where it wins**, and reports the costs that actually
-matter under concurrency: **throughput, latency, CPU, memory, and fairness.**
+A small **C++23 benchmark of thread synchronization primitives** — the classic
+"lock shootout." It compares five ways to coordinate access to shared data and
+measures the two numbers that matter under concurrency: **throughput (Mops/s)**
+and **per-operation latency (ns)**, as the thread count crosses the core count.
 
-It's not about crowning one winner — it's a map of *which primitive fits which
-contention regime*, and what you pay for it.
+It's not about one winner — it's about *which primitive fits which workload*.
 
-## Which primitive wins each use case
+## The five primitives
 
-![who wins each use case](docs/img/summary.png)
+### 1. `condition_variable` — a blocking lock you build yourself
+```cpp
+void lock() {
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&]{ return !held; });   // sleep until the lock is free
+    held = true;
+}
+void unlock() {
+    { std::lock_guard<std::mutex> lk(m); held = false; }
+    cv.notify_one();                      // wake one waiter
+}
+```
+A condition variable lets a thread **sleep until notified**. Here it's wired into
+a hand-rolled mutex — the textbook use. The benchmark shows you usually shouldn't:
+`std::mutex` does the same job with less overhead.
 
-*(one chart, every primitive × every use case; ★ = best in row, green→red = score
-relative to the row winner, gray = not applicable. Numbers are the measured
-values. 12-core machine, g++ 15.2 `-O3 -march=native`.)*
+### 2. `std::mutex` — the standard blocking lock
+```cpp
+void lock()   { m.lock(); }    // spins briefly, then parks on a futex
+void unlock() { m.unlock(); }
+```
+The default, and almost always the right default: cheap when uncontended, and it
+**parks** waiters (zero CPU) when contended, so it survives oversubscription.
 
-| use case | winner | numbers (this machine) | why |
-|---|---|---|---|
-| **uncontended** (lock rarely taken) | lock-free `atomic` | 141 vs `std::mutex` 43 Mops | fewest instructions, no syscall |
-| **contended, tiny section** (≤ cores) | `ttas+backoff` | 47 vs lock-free 25 Mops | dodges the cache-line storm; even beats a shared atomic |
-| **oversubscribed** (threads ≫ cores) | lock-free `atomic` (`std::mutex` best *lock*) | 24 / 9.2 Mops | **fair spin locks collapse** — ticket 0.1, mcs 0.0 |
-| **long critical section** (oversub) | `std::mutex` | leads as the section grows | parking; a spinner just steals the holder's core |
-| **fairness** (≤ cores) | `mcs` / `ticket` | cov 0.00–0.01 vs `tas` 0.2–0.5 | strict FIFO — nobody starves |
-| **read-only / read-mostly** | `std::shared_mutex` | 2.46 vs exclusive 0.29 Mops | readers run in parallel — *but only while writes are rare* |
-| **signaling latency** (core to spare) | `spin` | 97 ns vs `condition_variable` 54,000 ns | wakes at cache-coherence speed |
-| **signaling CPU thrift** | `condition_variable` | 0.8 vs `spin` 1.1 cores | a parked waiter costs ~0 CPU |
+### 3. `std::shared_mutex` — a reader-writer lock
+```cpp
+void lock_shared()   { m.lock_shared(); }   // many readers at once
+void unlock_shared() { m.unlock_shared(); }
+void lock()          { m.lock(); }          // or one exclusive writer
+```
+Lets **many readers run in parallel**, or one writer alone. Wins big when reads
+dominate and each read does real work — but it's heavier than a plain mutex, so
+it loses if writes are frequent or critical sections are tiny.
 
-**Five things the data shows:**
-1. `tas` (naked test-and-set) is never the right answer — `ttas+backoff` beats it everywhere.
-2. **Fair spin locks (ticket/MCS) convoy-collapse when oversubscribed** — fine ≤ cores, catastrophic past it.
-3. A **backoff spinlock can beat a lock-free atomic counter** at moderate contention (a shared `fetch_add` ping-pongs one cache line every op).
-4. `std::shared_mutex` only pays off when writes are genuinely rare — glibc is writer-preferring, so a few percent writes erase the win.
-5. Spinning buys signaling latency by **spending CPU**; parking is the opposite trade. Always look at the CPU axis, not just latency.
+### 4. `ticket` lock — a fair spinlock
+```cpp
+void lock() {
+    uint32_t my = next.fetch_add(1);                 // take a number
+    while (serving.load(acquire) != my) cpu_relax();  // busy-wait your turn
+}
+void unlock() { serving.store(serving.load() + 1, release); }  // serve the next
+```
+Strict **FIFO** — nobody starves. Great when threads fit on cores; but it *spins*
+(burns CPU) and **convoy-collapses when oversubscribed**: if the next ticket
+holder is descheduled, everyone behind it waits.
 
-## The details, per scenario
+### 5. lock-free `atomic` — no lock at all
+```cpp
+void write() { counter.fetch_add(1, relaxed); }     // atomic read-modify-write
+auto read()  { return counter.load(relaxed); }
+```
+The fastest option and never blocks — but it only works for a **single word**.
+Anything bigger than one atomic variable still needs a lock.
 
-| | |
-|---|---|
-| ![throughput](docs/img/contention_throughput.png) | ![cpu](docs/img/contention_cpu.png) |
-| **Throughput vs threads** — lock-free & backoff scale; fair locks collapse past 12 cores. | **CPU cost vs threads** — spin locks burn every core; `std::mutex` parks. |
-| ![fairness](docs/img/contention_fairness.png) | ![cs length](docs/img/cs_length.png) |
-| **Fairness** — ticket/MCS are even; TAS lets a thread hog the lock. | **Critical-section length (oversubscribed)** — spin for short, `std::mutex` for long. |
-| ![read heavy](docs/img/readheavy.png) | ![signaling](docs/img/signaling.png) |
-| **Read-heavy** — `shared_mutex` dominates at 0% writes, erodes fast. | **Signaling** — spin is fastest but burns CPU; parking is cheap CPU. |
+## Benchmark 1 — write-contended counter (mutual exclusion)
 
-Full discussion: **[docs/findings.md](docs/findings.md)**.
+Every thread increments a shared counter (`read = 0`, no critical-section work),
+so this measures pure lock cost as contention rises.
 
-## Primitives
+![write-contended throughput and latency](docs/img/write_contended.png)
 
-| family | primitives |
-|---|---|
-| **busy-wait** | `tas`, `ttas`, `ttas_backoff` (exponential backoff) |
-| **fair spin** | `ticket` (FIFO), `mcs` (queue lock, per-waiter cache line) |
-| **blocking** | `std::mutex` (futex park) |
-| **lock-free** | `atomic` counter (`fetch_add`) |
-| **reader-writer** | `std::shared_mutex` vs an exclusive-lock baseline |
-| **signaling** | `spin`, `spin+yield`, `condition_variable`, `std::atomic::wait` |
+Throughput (Mops/s, higher better) and latency at 8 threads (12-core machine):
+
+| primitive | 1 thr | 8 thr | 32 thr | latency @8 | size |
+|---|--:|--:|--:|--:|--:|
+| lock-free `atomic` | 97 | **27** | **24** | **299 ns** | 8 B |
+| `ticket` (fair spin) | 79 | 6.2 | 0.0 | 1290 ns | 8 B |
+| `std::mutex` | 39 | 8.3 | 10.3 | 964 ns | 40 B |
+| `std::shared_mutex` | 28 | 4.1 | 1.9 | 1929 ns | 56 B |
+| `condition_variable` | 18 | 1.5 | 0.4 | 5412 ns | 96 B |
+
+**Lock-free `atomic` wins throughput at every level.** Among the locks,
+`std::mutex` is best and the only one that stays steady when oversubscribed; the
+`ticket` spinlock is quick at 1 thread but **collapses past 12 cores** (FIFO
+convoy); the hand-rolled `condition_variable` lock is slowest — use `std::mutex`.
+
+## Benchmark 2 — read-only (reader-writer)
+
+100% reads, each holding the lock for a real (non-trivial) read section — the
+workload `std::shared_mutex` is built for. (Lock-free `atomic` is omitted: it can
+only guard one word, not a multi-step read.)
+
+![read-only throughput and latency](docs/img/read_mostly.png)
+
+Throughput (Mops/s, higher better):
+
+| primitive | 1 thr | 8 thr | 24 thr |
+|---|--:|--:|--:|
+| `std::shared_mutex` | 0.64 | **3.2** | **4.4** |
+| `std::mutex` | 0.63 | 0.31 | 0.32 |
+| `condition_variable` | 0.57 | 0.19 | 0.15 |
+| `ticket` (fair spin) | 0.64 | 0.38 | 0.00 |
+
+**`std::shared_mutex` is the only one that scales** — readers run concurrently
+(~10× a plain mutex at 8 threads, and still climbing at 24). The exclusive locks
+serialize every read, so they stay flat; `ticket` additionally convoy-collapses.
+
+> Note: glibc's `shared_mutex` is *writer-preferring*, so the win is fragile —
+> even a few percent writes let pending writers block the reader pool and
+> serialize it back down to (or below) a plain mutex.
 
 ## Quick start
 
 ```bash
-cmake --preset default && cmake --build build   # fetches Catch2 on first run
-ctest --test-dir build                          # every lock must actually exclude
+cmake --preset default && cmake --build build    # fetches Catch2 on first run
+ctest --test-dir build                           # every lock must actually exclude
 
-./scripts/sweep.sh        # run the grid -> results/sweep.csv
-python3 scripts/plot.py   # render the charts -> docs/img/
+./scripts/sweep.sh           # run the grid -> results/sweep.csv
+python3 scripts/plot.py      # render the charts -> docs/img/
 
-# single data point:
-./build/shootout --scenario contended --primitive ttas_backoff --threads 16 --cs 0
-./build/shootout --scenario readheavy  --primitive shared_mutex --threads 8 --write 0 --cs 2000
-./build/shootout --scenario signaling  --primitive cv --threads 1 --rounds 30000
+# one data point:
+./build/shootout --primitive ticket       --threads 8 --read 0  --cs 0
+./build/shootout --primitive shared_mutex --threads 8 --read 95 --cs 1000
 ```
 
 ## How it works
 
 | piece | where |
 |---|---|
-| Primitives behind `concept`s (`Mutex` / `SharedMutex` / `Gate`) | `include/shootout/{Mutexes,RWLocks,Gates}.hpp` |
-| Time-bounded scenarios returning a `Result` | `include/shootout/Scenarios.hpp` |
-| Cost metrics — CPU via `getrusage`, fairness, medians | `include/shootout/Metrics.hpp` |
-| One `-O3 -march=native` driver, runtime dispatch by name | `src/shootout.cpp` |
+| The five primitives, behind a `Lock` concept | `include/shootout/Primitives.hpp` |
+| The benchmark (one scenario, a `read` knob) | `include/shootout/Scenarios.hpp` |
+| Timing/throughput metrics | `include/shootout/Metrics.hpp` |
+| One `-O3 -march=native` driver, dispatch by name | `src/shootout.cpp` |
 | Catch2 mutual-exclusion tests | `src/tests.cpp` |
-
-Adding a primitive = one struct satisfying the relevant concept + one line in the
-dispatch table.
 
 ## Requirements & caveats
 
 - CMake ≥ 3.28, Ninja, a C++23 compiler (tested g++ 15.2); Python 3 + matplotlib + numpy for charts.
-- One 12-core box (WSL2). **Shapes and crossovers are portable; absolute numbers aren't** — re-run `sweep.sh` on your hardware.
-- `getrusage` CPU resolution is coarse, so runs are sized to ≥ ~100 ms.
-- A learning/benchmarking tool, not a lock library — primitives favor clarity.
+- One 12-core machine (WSL2). **Shapes and crossovers are portable; absolute numbers aren't** — re-run `sweep.sh` on your hardware.
+- A learning/benchmarking tool, not a lock library — the primitives favor clarity.
