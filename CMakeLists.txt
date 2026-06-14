@@ -1,11 +1,10 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(leetcode_compare
-  VERSION 0.2.0
-  DESCRIPTION "Benchmark harness comparing LeetCode solutions on time, memory & object size"
+project(sync_shootout
+  VERSION 0.1.0
+  DESCRIPTION "Benchmark shootout of synchronization primitives across scenarios"
   LANGUAGES CXX)
 
-# Modern C++ across the whole tree.
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -18,15 +17,27 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# Header-only library: the primitives, scenarios and metrics.
+add_library(shootout_headers INTERFACE)
+target_include_directories(shootout_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(shootout_headers INTERFACE Threads::Threads)
+target_compile_features(shootout_headers INTERFACE cxx_std_23)
+
+# The benchmark driver — built optimized; this is what the sweep script runs.
+add_executable(shootout src/shootout.cpp)
+target_link_libraries(shootout PRIVATE shootout_headers)
+target_compile_options(shootout PRIVATE -O3 -DNDEBUG -march=native)
+
+# Correctness tests (Catch2).
 include(FetchContent)
 FetchContent_Declare(
   Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
   GIT_TAG        v3.7.1
   GIT_SHALLOW    TRUE
-  SYSTEM                       # silence warnings from Catch2's own headers
-  EXCLUDE_FROM_ALL             # don't install/build Catch2 unless something uses it
-  FIND_PACKAGE_ARGS NAMES Catch2 # prefer a system Catch2 if one is installed
+  SYSTEM
+  EXCLUDE_FROM_ALL
+  FIND_PACKAGE_ARGS NAMES Catch2
 )
 FetchContent_MakeAvailable(Catch2)
 if(catch2_SOURCE_DIR)
@@ -35,12 +46,6 @@ endif()
 
 include(CTest)
 include(Catch)
-
-# Header-only engine. Include paths are rooted at the project so headers read as
-# "engine/..." and "problems/print-in-order/...".
-add_library(engine INTERFACE)
-target_include_directories(engine INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(engine INTERFACE Threads::Threads)
-target_compile_features(engine INTERFACE cxx_std_23)
-
-add_subdirectory(problems/print-in-order)
+add_executable(shootout_tests src/tests.cpp)
+target_link_libraries(shootout_tests PRIVATE shootout_headers Catch2::Catch2WithMain)
+catch_discover_tests(shootout_tests)

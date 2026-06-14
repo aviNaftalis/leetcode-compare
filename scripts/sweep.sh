@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# sweep.sh — run a parameter sweep over all solutions and emit a tidy CSV that
-# scripts/plot.py turns into graphs. Three series:
-#   oversub      relay, trivial handoff, varying oversubscription (lanes)
-#   grid         relay, varying (oversubscription x work) -> winner heatmap
-#   oneshot_work one-shot batch, varying work type -> "where parking wins" bars
-#
-# Usage: ./scripts/sweep.sh [build-dir]
-# Output: results/sweep.csv
+# sweep.sh — run the full shootout grid and emit results/sweep.csv for plot.py.
+# Series (each picked to show a use case where some primitive shines):
+#   contention   throughput / fairness / CPU vs thread count (tiny critical section)
+#   cs_length    throughput vs critical-section length, oversubscribed
+#   readheavy    throughput vs write fraction (reader-writer lock)
+#   signaling    hand-off latency + CPU, hot vs oversubscribed
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,44 +14,47 @@ CORES="$(nproc)"
 
 cmake --preset default -B "$BUILD" >/dev/null 2>&1 \
   || cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build "$BUILD" --target runners -j "$CORES" >/dev/null
-
-BIN="$BUILD/problems/print-in-order"
-SOLUTIONS=(condition_variable atomic_wait spinlock spinlock_pause spinlock_yield)
+cmake --build "$BUILD" --target shootout -j "$CORES" >/dev/null
+BIN="$BUILD/shootout"
 
 mkdir -p "$ROOT/results"
-echo "series,mode,solution,x,work,mag,median_ms,min_ms,max_ms,sizeof,rss_kib,cpu_ms,cores" > "$OUT"
+echo "series,scenario,primitive,threads,cs,write,wall_ms,cpu_ms,cores,throughput_Mops,ns_per_op,fairness_cov,bytes" > "$OUT"
 
-emit() { # series + a runner invocation -> append tagged CSV row
-  local series="$1"; shift; local sol="$1"; shift
-  local row; row="$("$BIN/runner_$sol" "$@" 2>/dev/null | grep '^CSV,' | sed 's/^CSV,//')"
+emit() { # series + shootout args -> tagged CSV row
+  local series="$1"; shift
+  local row; row="$("$BIN" "$@" 2>/dev/null | grep '^CSV,' | sed 's/^CSV,//')"
   echo "$series,$row" >> "$OUT"
-  echo "  [$series] $sol $*"
+  echo "  [$series] $*"
 }
 
-echo ">> Series 1/3: oversubscription crossover (relay, trivial handoff)"
-for lanes in 1 2 3 4 6 8 12 16 24 32; do
-  for s in "${SOLUTIONS[@]}"; do
-    emit oversub "$s" --mode relay --x "$lanes" --rounds 4000 --work none --trials 5
+LOCKS=(tas ttas ttas_backoff ticket mcs std_mutex atomic)
+
+echo ">> Series 1/4: contention vs thread count (tiny critical section)"
+for thr in 1 2 4 8 12 16 24 32; do
+  for p in "${LOCKS[@]}"; do
+    emit contention --scenario contended --primitive "$p" --threads "$thr" --cs 0 --secs 0.25 --trials 5
   done
 done
 
-echo ">> Series 2/3: oversubscription x work grid (relay)"
-for lanes in 1 4 12 24; do          # 0.25x, 1x, 3x, 6x cores
-  for wm in "none 0" "cpu 500" "cpu 4000"; do
-    set -- $wm
-    for s in "${SOLUTIONS[@]}"; do
-      emit grid "$s" --mode relay --x "$lanes" --rounds 1500 --work "$1" --mag "$2" --trials 3
-    done
+echo ">> Series 2/4: critical-section length, oversubscribed (24 threads)"
+for cs in 0 50 200 1000 5000 20000; do
+  for p in tas ttas_backoff ticket mcs std_mutex; do
+    emit cs_length --scenario contended --primitive "$p" --threads 24 --cs "$cs" --secs 0.25 --trials 5
   done
 done
 
-echo ">> Series 3/3: work-type comparison under contention (one-shot)"
-for wm in "none 0 30" "cpu 20000 12" "sleep 200 8"; do
-  set -- $wm                         # work mag reps
-  for s in "${SOLUTIONS[@]}"; do
-    emit oneshot_work "$s" --mode oneshot --x 32 --reps "$3" --work "$1" --mag "$2" --trials 5
+echo ">> Series 3/4: read-heavy vs write fraction (8 threads, meaty reads)"
+for w in 0 1 5 20 50; do
+  for p in shared_mutex excl_ttas excl_std; do
+    emit readheavy --scenario readheavy --primitive "$p" --threads 8 --write "$w" --cs 2000 --secs 0.25 --trials 5
   done
 done
 
-echo ">> Wrote $OUT ($(($(wc -l < "$OUT") - 1)) rows). Cores=$CORES (oversubscription = 3*lanes/$CORES)."
+echo ">> Series 4/4: signaling hand-off (hot=1 lane, oversubscribed=12 lanes)"
+for lanes in 1 12; do
+  for p in spin spin_yield cv atomic_wait; do
+    emit signaling --scenario signaling --primitive "$p" --threads "$lanes" --rounds 15000 --trials 3
+  done
+done
+
+echo ">> Wrote $OUT ($(($(wc -l < "$OUT") - 1)) rows). Cores=$CORES."
