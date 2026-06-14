@@ -15,7 +15,7 @@
 //                    non-oversubscribed spinlock wins.
 //
 // Emits one CSV line the sweep script parses:
-//   CSV,<mode>,<solution>,<x>,<work>,<mag>,<median_ms>,<min_ms>,<max_ms>,<sizeof>,<rss_kib>
+//   CSV,<mode>,<solution>,<x>,<work>,<mag>,<median_ms>,<min_ms>,<max_ms>,<sizeof>,<rss_kib>,<cpu_ms>,<cores>
 
 #include <charconv>
 #include <print>
@@ -97,9 +97,12 @@ int main(int argc, char** argv) {
 
     const long rss = engine::peakRSSKiB();
     std::println(stderr,
-                 "{:<18} mode={:<7} x={:<3} work={}/{:<6} median={:>9.2f} ms  sizeof={}B",
-                 std::string_view{SOLUTION_NAME}, mode, x, work, mag, t.median_ms, objsz);
-    std::println("CSV,{},{},{},{},{},{:.4f},{:.4f},{:.4f},{},{}", mode, SOLUTION_NAME,
-                 x, work, mag, t.median_ms, t.min_ms, t.max_ms, objsz, rss);
+                 "{:<18} mode={:<7} x={:<3} work={}/{:<6} median={:>9.2f} ms  "
+                 "cores={:>5.2f}  sizeof={}B",
+                 std::string_view{SOLUTION_NAME}, mode, x, work, mag, t.median_ms,
+                 t.cores, objsz);
+    std::println("CSV,{},{},{},{},{},{:.4f},{:.4f},{:.4f},{},{},{:.4f},{:.3f}", mode,
+                 SOLUTION_NAME, x, work, mag, t.median_ms, t.min_ms, t.max_ms, objsz,
+                 rss, t.cpu_ms, t.cores);
     return 0;
 }

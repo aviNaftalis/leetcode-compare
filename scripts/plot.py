@@ -53,7 +53,7 @@ def load():
     rows = []
     with open(CSV, newline="") as f:
         for r in csv.DictReader(f):
-            for k in ("x", "median_ms", "min_ms", "max_ms", "sizeof"):
+            for k in ("x", "median_ms", "min_ms", "max_ms", "sizeof", "cpu_ms", "cores"):
                 r[k] = float(r[k])
             rows.append(r)
     return rows
@@ -186,13 +186,51 @@ def plot_work_bars(rows):
     plt.close(fig)
 
 
+def plot_cpu_cost(rows):
+    """The hidden third axis: CPU burned (avg cores busied). Uses the one-shot
+    series (runs long enough for getrusage to measure CPU reliably). Pairs with
+    work_type_bars, which shows the *latency* of the same runs."""
+    data = by_series(rows, "oneshot_work")
+    works = []
+    for r in data:
+        key = (r["work"], r["mag"])
+        if key not in works:
+            works.append(key)
+    works = sorted(works, key=lambda k: (k[0] != "none", float(k[1])))
+    sols = [s for s in ORDER if any(r["solution"] == s for r in data)]
+    x = np.arange(len(works))
+    w = 0.8 / len(sols)
+    fig, ax = plt.subplots(figsize=(9.5, 5.5))
+    for i, sol in enumerate(sols):
+        ys = []
+        for wk in works:
+            m = [r["cores"] for r in data
+                 if r["solution"] == sol and (r["work"], r["mag"]) == wk]
+            ys.append(m[0] if m else 0)
+        ax.bar(x + i * w, ys, w, color=COLOR[sol], label=LABEL[sol])
+    ax.axhline(CORES, color="gray", ls=":", lw=1)
+    ax.text(x[-1] + 0.4, CORES, f"{CORES} cores", color="gray", va="bottom",
+            ha="right", fontsize=9)
+    ax.set_xticks(x + 0.4 - w / 2, [WORKLABEL.get(wk, "/".join(wk)) for wk in works])
+    ax.set_ylabel("CPU cost = average cores kept busy — lower is cheaper")
+    ax.set_xlabel("work per action (one-shot, 96 threads / %d cores)" % CORES)
+    ax.set_title("The third axis: CPU cost of each method (same runs as the latency chart)\n"
+                 "non-yielding spin pins every core; parking/yield use only what they need")
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(IMG, "cpu_cost.png"), dpi=130)
+    plt.close(fig)
+
+
 def main():
     rows = load()
     plot_oversub(rows)
     plot_handoff(rows)
     plot_heatmap(rows)
     plot_work_bars(rows)
-    print(f"Wrote 4 graphs to {IMG}")
+    plot_cpu_cost(rows)
+    print(f"Wrote 5 graphs to {IMG}")
 
 
 if __name__ == "__main__":

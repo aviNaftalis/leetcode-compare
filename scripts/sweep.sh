@@ -22,7 +22,7 @@ BIN="$BUILD/problems/print-in-order"
 SOLUTIONS=(condition_variable atomic_wait spinlock spinlock_pause spinlock_yield)
 
 mkdir -p "$ROOT/results"
-echo "series,mode,solution,x,work,mag,median_ms,min_ms,max_ms,sizeof,rss_kib" > "$OUT"
+echo "series,mode,solution,x,work,mag,median_ms,min_ms,max_ms,sizeof,rss_kib,cpu_ms,cores" > "$OUT"
 
 emit() { # series + a runner invocation -> append tagged CSV row
   local series="$1"; shift; local sol="$1"; shift

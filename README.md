@@ -17,7 +17,7 @@ micro-benchmarking.
 | **Solution** | one answer to a problem (a self-contained header) | `problems/<p>/solutions/*.hpp` |
 | **Test case** | a workload *shape* — concurrency, ordering, repetitions, and the **payload** each action runs — independent of any solution | `problems/<p>/testcases/*.hpp` |
 | **Work** | the payload: `none` / `cpu` (compute) / `sleep` (I/O stand-in), so the comparison reflects real work, not just a print | `engine/Work.hpp` |
-| **Test engine** | drives any solution (constrained by a `concept`) through any test case, verifies correctness, measures time + memory | `engine/Engine.hpp` |
+| **Test engine** | drives any solution (constrained by a `concept`) through any test case, verifies correctness, measures the three costs — **latency, CPU (avg cores busied via `getrusage`), and memory** | `engine/Engine.hpp` |
 
 A solution and a test case are combined by the engine in three front-ends:
 

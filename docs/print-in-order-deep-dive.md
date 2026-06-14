@@ -26,7 +26,9 @@ The five solutions compared (see [`../problems/print-in-order/solutions`](../pro
 
 There are **two independent knobs** that decide the winner: how many threads
 share the cores (**oversubscription**), and how long each thread holds the baton
-(**work**). The four graphs below take them one at a time, then together.
+(**work**). The graphs below take them one at a time, then together — and then
+look past latency at the **three real costs of a primitive: latency, CPU, and
+memory.**
 
 ---
 
@@ -130,6 +132,34 @@ solutions — because it hands the core back. The lesson is precise: it's
 **non-yielding** spinning under contention that loses, not lock-free code.
 
 ---
+
+## 5. The third axis — CPU cost (latency isn't the whole price)
+
+Wall-time is only one cost. A spinlock can *match* a parking primitive on
+latency while paying far more **CPU** — because a busy-waiting thread pins a core
+at 100% doing nothing. Measuring CPU-seconds (`getrusage` user+system) against
+wall-seconds gives "average cores kept busy":
+
+![cpu cost](img/cpu_cost.png)
+
+In the one-shot scenario (96 threads / 12 cores), the non-yielding spinlocks burn
+**~10.7 of the 12 cores** on every work type — the machine is saturated doing
+nothing useful. `yield` drops to ~3 cores, and `atomic_wait` / `condition_variable`
+sit at ~1.6 (just the threads doing real work; the rest are asleep).
+
+This compounds with latency rather than trading against it. At 6×
+oversubscription with cpu-heavy work, the naked spinlock isn't just ~30× slower —
+it also spends **~40× more CPU** doing it (≈58,000 ms of CPU vs `atomic_wait`'s
+≈1,400 ms). And in the hot-handoff regime where the spinlock *wins* on latency
+(§1), it still costs ~2.6 cores to the condition variable's ~1: spinning buys
+latency by spending CPU. Two takeaways:
+
+- **CPU cost is the spinlock's real downside even when latency looks fine.** On a
+  shared machine (cloud, CI, anything with neighbours) that wasted CPU is real
+  money and real contention for everyone else.
+- **Memory** is the cheap axis here: the spinlock / `atomic_wait` objects are
+  **4 B** vs the condition variable's **96 B** — irrelevant for one lock, but at
+  millions of locks the small lock-free object wins on cache footprint.
 
 ## The variables, summarised
 

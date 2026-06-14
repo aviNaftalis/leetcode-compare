@@ -146,26 +146,57 @@ bool runWorkload(const TestCase& tc) {
 #endif
 }
 
+// Total CPU time (all threads, user + system) charged to the process so far, in
+// milliseconds. getrusage(RUSAGE_SELF) aggregates every thread, including ones
+// that have already been joined — so a delta across a run captures the CPU its
+// worker threads burned. This is the metric that exposes a spinlock's true cost:
+// it can match wall-time while consuming far more CPU.
+[[nodiscard]] inline double cpuMillis() noexcept {
+#if defined(__unix__) || defined(__APPLE__)
+    rusage ru{};
+    ::getrusage(RUSAGE_SELF, &ru);
+    auto ms = [](timeval v) { return v.tv_sec * 1000.0 + v.tv_usec / 1000.0; };
+    return ms(ru.ru_utime) + ms(ru.ru_stime);
+#else
+    return 0.0;
+#endif
+}
+
 struct Timing {
-    double median_ms = 0;
+    double median_ms = 0; // wall time
     double min_ms = 0;
     double max_ms = 0;
+    double cpu_ms = 0;    // median CPU-time (all threads) per run
+    double cores = 0;     // cpu_ms / median_ms = average cores kept busy
 };
+
+// Given per-trial wall and CPU samples, build a Timing (medians + avg cores).
+[[nodiscard]] inline Timing summarize(std::vector<double> wall, std::vector<double> cpu) {
+    std::ranges::sort(wall);
+    std::ranges::sort(cpu);
+    Timing t{wall[wall.size() / 2], wall.front(), wall.back(),
+             cpu[cpu.size() / 2], 0};
+    t.cores = t.median_ms > 0 ? t.cpu_ms / t.median_ms : 0;
+    return t;
+}
 
 template <PrintInOrder Solution>
 [[nodiscard]] Timing timeWorkload(const TestCase& tc, int trials) {
     using clock = std::chrono::steady_clock;
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(trials));
+    std::vector<double> wall, cpu;
+    wall.reserve(static_cast<std::size_t>(trials));
+    cpu.reserve(static_cast<std::size_t>(trials));
     for ([[maybe_unused]] int t : std::views::iota(0, trials)) {
+        const double c0 = cpuMillis();
         const auto t0 = clock::now();
         const bool ok = runWorkload<Solution>(tc);
         const auto t1 = clock::now();
+        const double c1 = cpuMillis();
         if (!ok) return {}; // caller treats all-zero as failure
-        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        wall.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        cpu.push_back(c1 - c0);
     }
-    std::ranges::sort(samples);
-    return {samples[samples.size() / 2], samples.front(), samples.back()};
+    return summarize(std::move(wall), std::move(cpu));
 }
 
 // ---------------------------------------------------------------------------
@@ -228,16 +259,19 @@ void runRelay(const RelayCase& rc) {
 template <SequentialGate Gate>
 [[nodiscard]] Timing timeRelay(const RelayCase& rc, int trials) {
     using clock = std::chrono::steady_clock;
-    std::vector<double> samples;
-    samples.reserve(static_cast<std::size_t>(trials));
+    std::vector<double> wall, cpu;
+    wall.reserve(static_cast<std::size_t>(trials));
+    cpu.reserve(static_cast<std::size_t>(trials));
     for ([[maybe_unused]] int t : std::views::iota(0, trials)) {
+        const double c0 = cpuMillis();
         const auto t0 = clock::now();
         runRelay<Gate>(rc);
         const auto t1 = clock::now();
-        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        const double c1 = cpuMillis();
+        wall.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        cpu.push_back(c1 - c0);
     }
-    std::ranges::sort(samples);
-    return {samples[samples.size() / 2], samples.front(), samples.back()};
+    return summarize(std::move(wall), std::move(cpu));
 }
 
 } // namespace engine
